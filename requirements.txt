@@ -2,3 +2,7 @@ streamlit>=1.38
 pandas>=2.2
 python-dateutil>=2.9
 dateparser>=1.2
+openai>=1.0.0
+anthropic>=0.7.0
+ollama>=0.1.0
+requests>=2.31.0
