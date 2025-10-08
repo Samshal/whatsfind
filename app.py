@@ -59,12 +59,34 @@ def display_media_file(filename: str, media_data: bytes):
             st.image(media_data, caption=filename, use_column_width=True)
         
         elif file_ext == 'pdf':
-            # Display PDF download link and viewer
+            # Display PDF with browser-compatible viewer
             b64_pdf = base64.b64encode(media_data).decode()
-            pdf_display = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+            file_size = len(media_data) / 1024  # Size in KB
+            
+            st.info(f"📄 PDF Document: {filename} ({file_size:.1f} KB)")
+            
+            # Use object tag which is more compatible than iframe for production
+            pdf_display = f'''
+            <div style="width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 5px;">
+                <object data="data:application/pdf;base64,{b64_pdf}" 
+                        type="application/pdf" 
+                        width="100%" 
+                        height="100%">
+                    <div style="text-align: center; padding: 50px;">
+                        <p>📄 PDF viewer not supported in this browser.</p>
+                        <a href="data:application/pdf;base64,{b64_pdf}" 
+                           target="_blank" 
+                           style="background: #0066cc; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
+                           Open PDF in New Tab
+                        </a>
+                    </div>
+                </object>
+            </div>
+            '''
             st.markdown(pdf_display, unsafe_allow_html=True)
+            
             st.download_button(
-                label=f"📄 Download {filename}",
+                label=f"� Download {filename}",
                 data=media_data,
                 file_name=filename if not filename.endswith('.') else filename + 'pdf',
                 mime="application/pdf"
