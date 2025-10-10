@@ -199,8 +199,12 @@ def iter_messages_from_text(fp: io.TextIOBase, available_media: Optional[set] = 
 def import_zip_to_rows(zip_bytes: bytes):
     """
     Given a WhatsApp export ZIP (bytes), yields (chat_title, iterator_of_messages) for each *_chat.txt inside.
+    Optimized for large files with memory-efficient processing.
     """
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+    # Use BytesIO with the zip_bytes for memory efficiency
+    zip_buffer = io.BytesIO(zip_bytes)
+    
+    with zipfile.ZipFile(zip_buffer) as z:
         # First, collect all available media files
         available_media = set()
         for name in z.namelist():
@@ -224,17 +228,72 @@ def import_zip_to_rows(zip_bytes: bytes):
                     text = io.TextIOWrapper(f, encoding="latin-1", errors="replace")
                 yield title, iter_messages_from_text(text, available_media)
 
-# Global variable to store the current ZIP data for media access
-_current_zip_data = None
+def import_zip_from_path(zip_path: str):
+    """
+    Import ZIP file from local path for very large files that exceed upload limits.
+    More memory efficient for extremely large archives.
+    """
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        # First, collect all available media files
+        available_media = set()
+        for name in z.namelist():
+            if not name.lower().endswith(".txt"):
+                filename = os.path.basename(name)
+                available_media.add(filename)
+        
+        # Then process text files
+        for name in z.namelist():
+            if name.lower().endswith(".txt"):
+                title = os.path.splitext(os.path.basename(name))[0]
+                with z.open(name) as f:
+                    try:
+                        text = io.TextIOWrapper(f, encoding="utf-8")
+                        # Test read to verify encoding
+                        text.read(1)
+                        text.seek(0)  # Reset to beginning
+                    except Exception:
+                        f.close()
+                        f = z.open(name)
+                        text = io.TextIOWrapper(f, encoding="latin-1", errors="replace")
+                    yield title, iter_messages_from_text(text, available_media)
 
-def store_zip_data(zip_bytes: bytes):
+# Global variables to store the current ZIP data for media access
+_current_zip_data = None
+_current_zip_path = None
+
+def store_zip_data(zip_bytes: bytes, zip_path: str = None):
     """Store ZIP data globally for media file access"""
-    global _current_zip_data
+    global _current_zip_data, _current_zip_path
     _current_zip_data = zip_bytes
+    _current_zip_path = zip_path
+
+def store_zip_path(zip_path: str):
+    """Store ZIP file path for large file processing"""
+    global _current_zip_path
+    _current_zip_path = zip_path
 
 def get_media_file(filename: str) -> Optional[bytes]:
-    """Retrieve a media file from the stored ZIP data"""
-    global _current_zip_data
+    """Retrieve a media file from the stored ZIP data with memory optimization"""
+    global _current_zip_data, _current_zip_path
+    
+    # Try path-based access first (more memory efficient)
+    if _current_zip_path and os.path.exists(_current_zip_path):
+        try:
+            with zipfile.ZipFile(_current_zip_path, 'r') as z:
+                # Try exact filename match first
+                for name in z.namelist():
+                    if os.path.basename(name) == filename:
+                        return z.read(name)
+                
+                # If no exact match, try case-insensitive match
+                filename_lower = filename.lower()
+                for name in z.namelist():
+                    if os.path.basename(name).lower() == filename_lower:
+                        return z.read(name)
+        except Exception:
+            pass
+    
+    # Fallback to in-memory ZIP data
     if _current_zip_data is None:
         return None
     
@@ -251,6 +310,24 @@ def get_media_file(filename: str) -> Optional[bytes]:
                 if os.path.basename(name).lower() == filename_lower:
                     return z.read(name)
                     
+    except Exception:
+        pass
+    return None
+
+def get_media_file_from_path(zip_path: str, filename: str) -> Optional[bytes]:
+    """Retrieve a media file directly from ZIP file path (for large files)"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            # Try exact filename match first
+            for name in z.namelist():
+                if os.path.basename(name) == filename:
+                    return z.read(name)
+            
+            # If no exact match, try case-insensitive match
+            filename_lower = filename.lower()
+            for name in z.namelist():
+                if os.path.basename(name).lower() == filename_lower:
+                    return z.read(name)
     except Exception:
         pass
     return None

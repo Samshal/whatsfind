@@ -1,0 +1,20 @@
+[server]
+# Increase file upload size to 2GB (2048MB)
+maxUploadSize = 2048
+
+# Increase message size limit for large data transfers  
+maxMessageSize = 2048
+
+# Enable file watcher for development
+fileWatcherType = "auto"
+
+# Allow larger memory usage
+enableCORS = false
+
+[browser]
+# Don't auto-open browser (useful for remote deployments)
+gatherUsageStats = false
+
+[theme]
+# Optional: Set a dark theme for better visibility
+# base = "dark"

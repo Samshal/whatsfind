@@ -1,10 +1,12 @@
 import time
 import datetime
+import os
 from typing import Optional
 import streamlit as st
 import pandas as pd
+from config import LARGE_FILE_WARNING_MB, VERY_LARGE_FILE_MB, BATCH_SIZE, PROGRESS_UPDATE_INTERVAL
 from db import ensure_db, connect, upsert_chat, upsert_participant, bulk_insert_messages, list_facets, search, get_thread, get_chat_messages, get_chat_message_count, get_all_chats_with_stats, check_chat_has_messages, clear_chat_messages, clear_all_data
-from parser import import_zip_to_rows, store_zip_data, get_media_file, debug_media_files
+from parser import import_zip_to_rows, import_zip_from_path, store_zip_data, store_zip_path, get_media_file, get_media_file_from_path, debug_media_files
 from rag import rag_query, get_chat_summary
 import base64
 
@@ -87,7 +89,7 @@ def display_media_file(filename: str, media_data: bytes):
             st.markdown(pdf_display, unsafe_allow_html=True)
             
             st.download_button(
-                label=f"� Download {filename}",
+                label=f"📥 Download {filename}",
                 data=media_data,
                 file_name=filename if not filename.endswith('.') else filename + 'pdf',
                 mime="application/pdf"
@@ -162,20 +164,42 @@ def display_media_file(filename: str, media_data: bytes):
         # Fallback download for DOC files
         if filename.startswith('DOC-'):
             st.download_button(
-                label=f"� Download {filename} (PDF)",
+                label=f"📥 Download {filename} (PDF)",
                 data=media_data,
                 file_name=filename if not filename.endswith('.') else filename + 'pdf',
                 mime="application/pdf"
             )
         else:
             st.download_button(
-                label=f"�📎 Download {filename}",
+                label=f"📎 Download {filename}",
                 data=media_data,
                 file_name=filename,
                 mime="application/octet-stream"
             )
 
+def get_media_for_display(filename: str) -> bytes:
+    """Get media file data for display, handling both upload methods"""
+    global _current_zip_path
+    
+    # Try path-based access first if available (for large files)
+    if '_current_zip_path' in globals() and _current_zip_path:
+        try:
+            from parser import get_media_file_from_path
+            return get_media_file_from_path(_current_zip_path, filename)
+        except:
+            pass
+    
+    # Fallback to regular method
+    return get_media_file(filename)
+
 with st.expander("Import WhatsApp Export (ZIP)", expanded=True):
+    # Import method selection
+    import_method = st.radio(
+        "Import Method:",
+        ["📤 Upload ZIP file (up to 2GB)", "📁 Local file path (for very large files)"],
+        help="Choose upload method based on your file size"
+    )
+    
     # Import options
     col1, col2 = st.columns(2)
     with col1:
@@ -185,8 +209,46 @@ with st.expander("Import WhatsApp Export (ZIP)", expanded=True):
             help="Choose how to handle existing data when importing"
         )
     
-    with col2:
-        zip_file = st.file_uploader("Upload WhatsApp export ZIP", type=["zip"], accept_multiple_files=False)
+    # File input based on method
+    zip_file = None
+    zip_file_path = None
+    bytes_data = None
+    
+    if import_method == "📤 Upload ZIP file (up to 2GB)":
+        with col2:
+            zip_file = st.file_uploader("Upload WhatsApp export ZIP", type=["zip"], accept_multiple_files=False)
+            
+        if zip_file is not None:
+            # Show file size info
+            file_size_mb = len(zip_file.getvalue()) / 1024 / 1024
+            st.info(f"📊 File size: {file_size_mb:.1f} MB")
+            
+            if file_size_mb > LARGE_FILE_WARNING_MB:  # Over 1GB
+                st.warning("⚠️ Large file detected! Consider using the 'Local file path' method for better performance.")
+            
+            bytes_data = zip_file.read()
+            store_zip_data(bytes_data)
+    
+    else:  # Local file path method
+        with col2:
+            zip_file_path = st.text_input(
+                "Enter full path to ZIP file:",
+                placeholder="/path/to/your/whatsapp_export.zip",
+                help="Enter the complete file path to your WhatsApp export ZIP file"
+            )
+            
+            if zip_file_path:
+                if os.path.exists(zip_file_path) and zip_file_path.lower().endswith('.zip'):
+                    # Show file size info
+                    file_size_mb = os.path.getsize(zip_file_path) / 1024 / 1024
+                    st.success(f"✅ File found! Size: {file_size_mb:.1f} MB")
+                    
+                    if file_size_mb > VERY_LARGE_FILE_MB:  # Over 2GB
+                        st.info("💡 Very large file detected. Processing will be optimized for memory efficiency.")
+                    
+                    store_zip_path(zip_file_path)
+                elif zip_file_path:
+                    st.error("❌ File not found or not a ZIP file. Please check the path.")
     
     # Show existing data warning if applicable
     with connect() as conn:
@@ -196,26 +258,40 @@ with st.expander("Import WhatsApp Export (ZIP)", expanded=True):
         elif existing_chats and import_mode != "Clear all data first":
             st.info(f"ℹ️ You have {len(existing_chats)} existing chat(s). Import mode: {import_mode}")
     
-    if zip_file is not None:
-        bytes_data = zip_file.read()
-        # Store ZIP data for media access
-        store_zip_data(bytes_data)
+    # Process the import
+    should_process = (bytes_data is not None) or (zip_file_path and os.path.exists(zip_file_path))
+    
+    if should_process:
         
         # Debug: Show media files detected
         with st.expander("🔍 Debug: Media Files Detected", expanded=False):
-            media_debug = debug_media_files(bytes_data)
-            st.write(f"Found {len([f for f in media_debug.keys() if f != 'error'])} media files:")
+            if bytes_data:
+                media_debug = debug_media_files(bytes_data)
+            else:
+                # For file path method, we'll create a simple debug without reading all data
+                st.info("Media file detection available after processing starts (memory-optimized mode)")
+                media_debug = {}
             
-            doc_files = {k: v for k, v in media_debug.items() if k.startswith('DOC-')}
-            if doc_files:
-                st.write("**Document files:**")
-                for filename, info in doc_files.items():
-                    status = "✅ Detected" if info.get('matches_pattern') else "❌ Not detected"
-                    st.write(f"- {filename} → {status}")
+            if media_debug:
+                st.write(f"Found {len([f for f in media_debug.keys() if f != 'error'])} media files:")
+                
+                doc_files = {k: v for k, v in media_debug.items() if k.startswith('DOC-')}
+                if doc_files:
+                    st.write("**Document files:**")
+                    for filename, info in doc_files.items():
+                        status = "✅ Detected" if info.get('matches_pattern') else "❌ Not detected"
+                        st.write(f"- {filename} → {status}")
         
         imported = 0
         skipped = 0
         start = time.time()
+        
+        # Choose the appropriate import method
+        if bytes_data:
+            import_iterator = import_zip_to_rows(bytes_data)
+        else:
+            import_iterator = import_zip_from_path(zip_file_path)
+        
         with connect() as conn:
             conn.execute("BEGIN")
             try:
@@ -226,38 +302,59 @@ with st.expander("Import WhatsApp Export (ZIP)", expanded=True):
                     st.success("✅ All existing data cleared.")
                 
                 chat_count = 0
-                for title, msg_iter in import_zip_to_rows(bytes_data):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for title, msg_iter in import_iterator:
                     chat_count += 1
                     chat_id = upsert_chat(conn, title)
                     
                     # Check if chat already has messages (unless we're in "add anyway" mode)
                     if import_mode == "Skip duplicates (recommended)" and check_chat_has_messages(conn, chat_id):
-                        st.info(f"⏭️ Skipping chat '{title}' - already has messages")
+                        status_text.text(f"⏭️ Skipping chat '{title}' - already has messages")
                         skipped += 1
                         continue
                     elif import_mode == "Clear all data first" and check_chat_has_messages(conn, chat_id):
                         # This shouldn't happen since we cleared data, but just in case
                         clear_chat_messages(conn, chat_id)
                     
-                    st.info(f"📥 Processing chat: {title}")
+                    status_text.text(f"📥 Processing chat {chat_count}: {title}")
                     
                     batch = []
                     seen_senders = set()
                     message_count = 0
+                    batch_count = 0
+                    
                     for ts_ms, sender, text, msg_type, has_media, media_path in msg_iter:
                         message_count += 1
                         if sender and sender not in seen_senders:
                             upsert_participant(conn, chat_id, sender)
                             seen_senders.add(sender)
                         batch.append((chat_id, ts_ms, sender, msg_type, text, has_media, media_path))
-                        if len(batch) >= 1000:
+                        
+                        if len(batch) >= BATCH_SIZE:
                             bulk_insert_messages(conn, batch)
                             imported += len(batch)
                             batch.clear()
+                            batch_count += 1
+                            
+                            # Update progress periodically
+                            if batch_count % PROGRESS_UPDATE_INTERVAL == 0:
+                                status_text.text(f"📥 Processing chat '{title}': {imported:,} messages processed...")
+                    
                     if batch:
                         bulk_insert_messages(conn, batch)
                         imported += len(batch)
-                    st.success(f"✅ Chat '{title}': imported {message_count} messages")
+                    
+                    # Update overall progress
+                    progress_percentage = min(chat_count / max(1, len(list(existing_chats)) + 10), 1.0)  # Rough estimate
+                    progress_bar.progress(progress_percentage)
+                    
+                    st.success(f"✅ Chat '{title}': imported {message_count:,} messages")
+                
+                # Complete progress
+                progress_bar.progress(1.0)
+                status_text.text("✅ Import completed!")
                 
                 conn.execute("COMMIT")
             except Exception as e:
@@ -315,6 +412,181 @@ else:
                 last_date = datetime.datetime.fromtimestamp(selected_chat["last_message_ts"]/1000).strftime("%Y-%m-%d %H:%M")
                 st.write(f"**Date range:** {first_date} to {last_date}")
             
+            # Print functionality
+            st.markdown("---")
+            with st.expander("🖨️ Print Conversation", expanded=False):
+                st.markdown("**Print Options**")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    print_order = st.radio(
+                        "Message Order", 
+                        ["Oldest First (Chronological)", "Newest First (Recent)"],
+                        help="Choose how messages should be ordered in the print view"
+                    )
+                
+                with col2:
+                    print_limit = st.number_input(
+                        "Number of Messages", 
+                        min_value=10, 
+                        max_value=5000, 
+                        value=100,
+                        step=10,
+                        help="How many messages to include (starting from the selected order)"
+                    )
+                
+                with col3:
+                    include_media = st.checkbox(
+                        "Include Media References", 
+                        value=True,
+                        help="Include references to attached media files"
+                    )
+                
+                if st.button("📋 Generate Print View", type="primary"):
+                    with st.spinner("Generating print view..."):
+                        # Get messages in the requested order
+                        if print_order == "Oldest First (Chronological)":
+                            # Get oldest messages first
+                            print_messages = list(conn.execute(
+                                "SELECT * FROM messages WHERE chat_id = ? ORDER BY ts ASC LIMIT ?",
+                                (selected_chat_id, print_limit)
+                            ))
+                        else:
+                            # Get newest messages first
+                            print_messages = get_chat_messages(conn, selected_chat_id, print_limit, 0)
+                        
+                        if print_messages:
+                            # Create print-friendly HTML
+                            html_content = f"""
+                            <style>
+                                .print-container {{
+                                    font-family: 'Arial', sans-serif;
+                                    max-width: 800px;
+                                    margin: 0 auto;
+                                    padding: 20px;
+                                    line-height: 1.6;
+                                }}
+                                .chat-header {{
+                                    text-align: center;
+                                    border-bottom: 2px solid #333;
+                                    padding-bottom: 20px;
+                                    margin-bottom: 30px;
+                                }}
+                                .message {{
+                                    margin-bottom: 15px;
+                                    padding: 10px;
+                                    border-left: 3px solid #007acc;
+                                    background-color: #f8f9fa;
+                                }}
+                                .message-header {{
+                                    font-weight: bold;
+                                    color: #333;
+                                    margin-bottom: 5px;
+                                }}
+                                .message-content {{
+                                    margin-left: 10px;
+                                    white-space: pre-wrap;
+                                }}
+                                .media-reference {{
+                                    font-style: italic;
+                                    color: #666;
+                                    margin-top: 5px;
+                                }}
+                                .print-footer {{
+                                    margin-top: 30px;
+                                    padding-top: 20px;
+                                    border-top: 1px solid #ccc;
+                                    text-align: center;
+                                    font-size: 12px;
+                                    color: #666;
+                                }}
+                                @media print {{
+                                    .print-container {{
+                                        margin: 0;
+                                        padding: 10px;
+                                    }}
+                                }}
+                            </style>
+                            <div class="print-container">
+                                <div class="chat-header">
+                                    <h1>WhatsApp Conversation</h1>
+                                    <h2>{selected_chat['title']}</h2>
+                                    <p><strong>Total Messages in Print:</strong> {len(print_messages)}</p>
+                                    <p><strong>Generated on:</strong> {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                                </div>
+                            """
+                            
+                            for msg in print_messages:
+                                msg_time = datetime.datetime.fromtimestamp(msg["ts"]/1000)
+                                time_str = msg_time.strftime("%Y-%m-%d %H:%M:%S")
+                                sender = msg["sender"] if msg["sender"] else "System"
+                                
+                                html_content += f"""
+                                <div class="message">
+                                    <div class="message-header">{sender} — {time_str}</div>
+                                    <div class="message-content">{msg["text"] if msg["text"] else "[No text content]"}</div>
+                                """
+                                
+                                if include_media and msg["has_media"] and msg["media_path"]:
+                                    html_content += f'<div class="media-reference">📎 Media: {msg["media_path"]}</div>'
+                                
+                                html_content += "</div>"
+                            
+                            html_content += f"""
+                                <div class="print-footer">
+                                    <p>Exported from WhatsFind - WhatsApp Chat Viewer</p>
+                                    <p>Chat: {selected_chat['title']} | Messages: {len(print_messages)} | Order: {print_order}</p>
+                                </div>
+                            </div>
+                            """
+                            
+                            # Display the print view
+                            st.success(f"✅ Print view generated with {len(print_messages)} messages!")
+                            st.markdown("""
+                            **Instructions:**
+                            1. Click the button below to open the print view in a new tab
+                            2. Use your browser's print function (Ctrl+P or Cmd+P)
+                            3. Select "Save as PDF" if you want to save it as a file
+                            """)
+                            
+                            # Create a downloadable HTML file
+                            st.download_button(
+                                label="📥 Download as HTML",
+                                data=html_content,
+                                file_name=f"whatsapp_chat_{selected_chat['title'].replace(' ', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+                                mime="text/html",
+                                help="Download the conversation as an HTML file that you can open and print"
+                            )
+                            
+                            # Display the HTML content in an expandable section
+                            with st.expander("👀 Preview Print Layout", expanded=False):
+                                st.markdown("**Preview (simplified text format):**")
+                                st.markdown(f"# WhatsApp Conversation: {selected_chat['title']}")
+                                st.markdown(f"**Messages:** {len(print_messages)} | **Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                                st.markdown("---")
+                                
+                                # Show first few messages as preview
+                                preview_count = min(5, len(print_messages))
+                                for i, msg in enumerate(print_messages[:preview_count]):
+                                    msg_time = datetime.datetime.fromtimestamp(msg["ts"]/1000)
+                                    time_str = msg_time.strftime("%Y-%m-%d %H:%M:%S")
+                                    sender = msg["sender"] if msg["sender"] else "System"
+                                    
+                                    st.markdown(f"**{sender}** — *{time_str}*")
+                                    if msg["text"]:
+                                        st.markdown(f"> {msg['text']}")
+                                    if include_media and msg["has_media"] and msg["media_path"]:
+                                        st.markdown(f"*📎 Media: {msg['media_path']}*")
+                                    st.markdown("---")
+                                
+                                if len(print_messages) > preview_count:
+                                    st.markdown(f"*... and {len(print_messages) - preview_count} more messages (download HTML to see all)*")
+                        
+                        else:
+                            st.warning("No messages found for the selected options.")
+            
+            st.markdown("---")
             # Pagination controls
             messages_per_page = st.slider("Messages per page", min_value=10, max_value=200, value=50, step=10)
             total_pages = (total_messages + messages_per_page - 1) // messages_per_page
@@ -404,7 +676,7 @@ else:
                         if msg["has_media"]:
                             if msg["media_path"]:
                                 # Try to load and display the actual media file
-                                media_data = get_media_file(msg["media_path"])
+                                media_data = get_media_for_display(msg["media_path"])
                                 if media_data:
                                     st.write("📎 **Media:**")
                                     # Special labeling for DOC files
@@ -464,31 +736,32 @@ else:
         hm = None if has_media == "Any" else (has_media == "Yes")
 
         if st.button("Run search", type="primary") and q.strip():
-            try:
-                rows = search(conn, q.strip(), chat_id, sender_val, t1, t2, hm, int(limit), int(offset))
-                if not rows:
-                    st.info("No results.")
-                else:
-                    df = pd.DataFrame([dict(r) for r in rows])
-                    df["time"] = df["ts"].apply(lambda ms: datetime.datetime.fromtimestamp(ms/1000).isoformat())
-                    st.dataframe(df[["id","chat_id","time","sender","text","has_media"]], width='stretch', hide_index=True)
-                    st.caption("Open a specific message ID in a thread view below.")
-                    selected_id = st.number_input("Message id to open", min_value=int(df["id"].min()), max_value=int(df["id"].max()), value=int(df["id"].iloc[0]))
-                    if st.button("Open thread"):
-                        thread, center = get_thread(conn, int(selected_id), context=25)
-                        if not thread:
-                            st.info("No thread available for that message ID.")
-                        else:
-                            st.subheader("Thread view")
-                            for r in thread:
-                                who = r["sender"] or "System"
-                                st.markdown(f"**{who}** — `{r['ts']}`")
-                                st.write(r["text"] or "")
-                                if r["has_media"] and r["media_path"]:
-                                    st.caption(f"Media: {r['media_path']}")
-                            st.caption("End of thread.")
-            except Exception as e:
-                st.error(f"Search error: {e}")
+            with connect() as conn:
+                try:
+                    rows = search(conn, q.strip(), chat_id, sender_val, t1, t2, hm, int(limit), int(offset))
+                    if not rows:
+                        st.info("No results.")
+                    else:
+                        df = pd.DataFrame([dict(r) for r in rows])
+                        df["time"] = df["ts"].apply(lambda ms: datetime.datetime.fromtimestamp(ms/1000).isoformat())
+                        st.dataframe(df[["id","chat_id","time","sender","text","has_media"]], width='stretch', hide_index=True)
+                        st.caption("Open a specific message ID in a thread view below.")
+                        selected_id = st.number_input("Message id to open", min_value=int(df["id"].min()), max_value=int(df["id"].max()), value=int(df["id"].iloc[0]))
+                        if st.button("Open thread"):
+                            thread, center = get_thread(conn, int(selected_id), context=25)
+                            if not thread:
+                                st.info("No thread available for that message ID.")
+                            else:
+                                st.subheader("Thread view")
+                                for r in thread:
+                                    who = r["sender"] or "System"
+                                    st.markdown(f"**{who}** — `{r['ts']}`")
+                                    st.write(r["text"] or "")
+                                    if r["has_media"] and r["media_path"]:
+                                        st.caption(f"Media: {r['media_path']}")
+                                st.caption("End of thread.")
+                except Exception as e:
+                    st.error(f"Search error: {e}")
 
     with tab3:
         st.header("🤖 Chat AI - Ask Questions About Your Chats")
